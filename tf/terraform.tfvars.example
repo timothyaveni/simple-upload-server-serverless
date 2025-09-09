@@ -1,0 +1,6 @@
+base_domain = "autograder-artifacts-fa25.160.tja.io"
+project_name = "autograder-artifacts-fa25"
+max_content_length_mb = 100
+region = "us-west-2"
+route53_zone_id = "Z00xxxx"
+upload_key = "xxxx"
