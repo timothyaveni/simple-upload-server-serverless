@@ -1,137 +1,66 @@
-// - Auth via API-Key header equals process.env.UPLOAD_KEY
-// - Max zip size 100 MB
-// - Multipart "file" expected; unzip into S3 prefix "<uuid>/"
-// - Return https://{uuid}.{BASE_DOMAIN}/
-// Notes:
-// - API Gateway must pass the body as base64 for multipart; we handle decoding.
-// - We stream the zip entries straight to S3 to avoid large /tmp writes.
-// - Directory entries in the zip are ignored; file entries are uploaded preserving paths.
-
-import { S3Client } from "@aws-sdk/client-s3";
+// index.mjs (add these imports)
+import {
+  S3Client,
+  GetObjectCommand,
+  PutObjectCommand,
+  DeleteObjectCommand,
+} from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { Upload } from "@aws-sdk/lib-storage";
-import mime from "mime-types";
-import Busboy from "busboy";
 import unzipper from "unzipper";
-import { randomUUID } from "crypto"; // Node 20 native
-import { Buffer } from "buffer";
+import mime from "mime-types";
+import { randomUUID } from "crypto";
 
-// ----- Config (injected via Terraform) -----
+const s3 = new S3Client({});
 const {
-  UPLOAD_KEY, // same as your .env UPLOAD_KEY
-  BASE_DOMAIN, // e.g., autograder-artifacts-sp25.160.tja.io
-  BUCKET_NAME, // S3 bucket storing extracted files
-  MAX_CONTENT_LENGTH_MB, // "100"
+  UPLOAD_KEY,
+  BASE_DOMAIN,
+  BUCKET_NAME,
+  MAX_CONTENT_LENGTH_MB = "100",
 } = process.env;
 
-const MAX_BYTES = Number(MAX_CONTENT_LENGTH_MB || "100") * 1024 * 1024;
-const s3 = new S3Client({});
+const MAX_BYTES = Number(MAX_CONTENT_LENGTH_MB) * 1024 * 1024;
+const STAGING_PREFIX = "incoming/";
 
 function contentTypeFor(key) {
   const guess = mime.lookup(key) || "application/octet-stream";
-  // mime.contentType() returns e.g. "text/html; charset=utf-8"
   return mime.contentType(guess) || "application/octet-stream";
 }
 
-// Small helper: stream zip entry to S3 under a given key
 async function putS3Stream(key, stream) {
-  // Use managed multipart upload so we don’t need ContentLength on streams.
   const up = new Upload({
     client: s3,
     params: {
       Bucket: BUCKET_NAME,
       Key: key,
-      ContentType: contentTypeFor(key),
       Body: stream,
       StorageClass: "INTELLIGENT_TIERING",
+      ContentType: contentTypeFor(key),
     },
-    // conservative defaults for Lambda memory/IO
-    queueSize: 3, // parallel parts
-    partSize: 8 * 1024 * 1024, // 8 MiB
+    queueSize: 3,
+    partSize: 8 * 1024 * 1024,
   });
   await up.done();
 }
 
-// Parse multipart/form-data body using Busboy.
-// Returns a Buffer of the uploaded file (we'll pipe to unzipper) and original filename.
-// NOTE: For big zips you could stream directly to unzipper; we keep it simple & safe within 100 MB.
-function parseMultipart(event) {
+// robustly collect a Node stream into a Buffer
+function streamToBuffer(stream) {
   return new Promise((resolve, reject) => {
-    const contentType =
-      event.headers["content-type"] || event.headers["Content-Type"];
-    if (!contentType || !contentType.includes("multipart/form-data")) {
-      return reject(
-        Object.assign(new Error("No multipart/form-data"), { statusCode: 400 })
-      );
-    }
-
-    const bb = Busboy({ headers: { "content-type": contentType } });
     const chunks = [];
-    let total = 0;
-    let gotFile = false;
-    let filename = "";
-
-    bb.on("file", (fieldname, file, info) => {
-      // Expect the field to be "file", but accept any single file field to keep parity with your Flask handler.
-      gotFile = true;
-      filename = info.filename || "upload.zip";
-      file.on("data", (d) => {
-        total += d.length;
-        if (total > MAX_BYTES) {
-          file.unpipe();
-          bb.emit(
-            "error",
-            Object.assign(new Error("Payload too large"), { statusCode: 413 })
-          );
-          return;
-        }
-        chunks.push(d);
-      });
-    });
-
-    bb.on("field", () => {
-      /* ignored */
-    });
-
-    bb.on("finish", () => {
-      if (!gotFile)
-        return reject(
-          Object.assign(new Error("No file part"), { statusCode: 400 })
-        );
-      resolve({ buffer: Buffer.concat(chunks), filename });
-    });
-
-    bb.on("error", (err) => reject(err));
-
-    // Body comes base64-encoded from API Gateway for binary types
-    const body = event.isBase64Encoded
-      ? Buffer.from(event.body || "", "base64")
-      : Buffer.from(event.body || "");
-    bb.end(body);
+    stream.on("data", (c) => chunks.push(c));
+    stream.once("end", () => resolve(Buffer.concat(chunks)));
+    stream.once("error", reject);
   });
 }
 
-// Extract the zip buffer and stream files into S3 under prefix "<folderId>/"
-async function extractZipBufferToS3(folderId, buffer) {
-  // unzipper supports Buffer source
-  const directory = await unzipper.Open.buffer(buffer);
-  const uploads = directory.files
-    .filter((f) => !f.path.endsWith("/")) // ignore folders
-    .map(async (f) => {
-      const stream = await f.stream();
-      const key = `${folderId}/${f.path}`;
-      await putS3Stream(key, stream);
-    });
-  await Promise.all(uploads);
-}
-
+// ---- handler ----
 export const handler = async (event) => {
   try {
-    // --- Auth ---
-    const headerKey =
-      event.headers["api-key"] ||
-      event.headers["API-Key"] ||
-      event.headers["Api-Key"];
-    if (!UPLOAD_KEY || headerKey !== UPLOAD_KEY) {
+    const keyHdr =
+      event?.headers?.["api-key"] ||
+      event?.headers?.["API-Key"] ||
+      event?.headers?.["Api-Key"];
+    if (!UPLOAD_KEY || keyHdr !== UPLOAD_KEY) {
       return {
         statusCode: 401,
         headers: { "content-type": "application/json" },
@@ -139,36 +68,94 @@ export const handler = async (event) => {
       };
     }
 
-    if (!event.body) {
+    const method = event?.requestContext?.http?.method || "GET";
+    const path = (event?.rawPath || "/").replace(/\/+$/, ""); // strip trailing slash
+
+    // --- 1) INIT: get a presigned PUT URL to S3 for the zip ---
+    if (method === "POST" && path === "/upload/init") {
+      const uuid = randomUUID();
+      const key = `${STAGING_PREFIX}${uuid}.zip`;
+      const putUrl = await getSignedUrl(
+        s3,
+        new PutObjectCommand({
+          Bucket: BUCKET_NAME,
+          Key: key,
+          ContentType: "application/zip", // client must send this
+        }),
+        { expiresIn: 900 } // 15 minutes
+      );
+      const completeUrl = `/upload/complete?uuid=${uuid}`;
       return {
-        statusCode: 400,
+        statusCode: 200,
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ error: "No file part" }),
+        body: JSON.stringify({ uuid, putUrl, completeUrl }),
       };
     }
 
-    // --- Parse multipart & enforce size ---
-    const { buffer } = await parseMultipart(event);
+    // --- 2) COMPLETE: unzip the staged object and return final URL ---
+    if (method === "POST" && path === "/upload/complete") {
+      const qs = new URLSearchParams(event.rawQueryString || "");
+      const uuid = qs.get("uuid");
+      if (!uuid) {
+        return {
+          statusCode: 400,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ error: "missing uuid" }),
+        };
+      }
 
-    // --- Create folder ID and extract to S3 ---
-    const folderId = randomUUID();
-    await extractZipBufferToS3(folderId, buffer);
+      const stagingKey = `${STAGING_PREFIX}${uuid}.zip`;
 
-    // --- Return URL matching your pattern ---
-    const url = `https://${folderId}.${BASE_DOMAIN}/`;
+      // 1) download staged zip from S3
+      const obj = await s3.send(
+        new GetObjectCommand({ Bucket: BUCKET_NAME, Key: stagingKey })
+      );
+
+      // 2) buffer it (avoids fragile stream piping issues)
+      const zipBuf = await streamToBuffer(obj.Body);
+
+      // guard against giant files (parity with your MAX_CONTENT_LENGTH_MB)
+      if (zipBuf.length > MAX_BYTES) {
+        return {
+          statusCode: 413,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ error: "Payload too large" }),
+        };
+      }
+
+      // 3) unzip from buffer and stream each entry to S3 under <uuid>/
+      const directory = await unzipper.Open.buffer(zipBuf);
+      await Promise.all(
+        directory.files
+          .filter((f) => !f.path.endsWith("/")) // ignore folders
+          .map(async (f) => {
+            const stream = await f.stream(); // uncompressed file stream
+            const key = `${uuid}/${f.path}`;
+            await putS3Stream(key, stream); // sets ContentType, uses multipart
+          })
+      );
+
+      // optional: clean up the staged zip
+      await s3.send(new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: stagingKey }));
+
+      const url = `https://${uuid}.${BASE_DOMAIN}/`;
+      return {
+        statusCode: 201,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ url }),
+      };
+    }
     return {
-      statusCode: 201,
+      statusCode: 404,
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify({ error: "Not Found" }),
     };
   } catch (err) {
-    const statusCode = err.statusCode || 500;
+    console.error("UPLOAD_ERROR", err && (err.stack || err.message || err));
     return {
-      statusCode,
+      statusCode: 500,
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        error: statusCode === 500 ? "Internal Server Error" : err.message,
-      }),
+      body: JSON.stringify({ error: "Internal Server Error" }),
     };
   }
 };

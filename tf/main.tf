@@ -206,28 +206,43 @@ resource "aws_iam_role_policy_attachment" "lambda_basic" {
   role       = aws_iam_role.lambda_exec.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
-
-resource "aws_iam_policy" "lambda_s3_put" {
-  name   = "${var.project_name}-lambda-s3-put"
+# replace the old lambda_s3_put policy with this:
+resource "aws_iam_policy" "lambda_s3_access" {
+  name   = "${var.project_name}-lambda-s3-access"
   policy = jsonencode({
     Version = "2012-10-17",
-    Statement = [{
-      Effect   = "Allow",
-      Action   = [
-        "s3:PutObject",
-        "s3:CreateMultipartUpload",
-        "s3:UploadPart",
-        "s3:CompleteMultipartUpload",
-        "s3:AbortMultipartUpload"
-      ],
-      Resource = ["${aws_s3_bucket.uploads.arn}/*"]
-    }]
+    Statement: [
+      {
+        Sid: "WriteExtractedFiles",
+        Effect: "Allow",
+        Action: [
+          "s3:PutObject",
+          "s3:CreateMultipartUpload",
+          "s3:UploadPart",
+          "s3:CompleteMultipartUpload",
+          "s3:AbortMultipartUpload"
+        ],
+        Resource: ["${aws_s3_bucket.uploads.arn}/*"]
+      },
+      {
+        Sid: "ReadStagedZip",
+        Effect: "Allow",
+        Action: ["s3:GetObject","s3:HeadObject"],
+        Resource: ["${aws_s3_bucket.uploads.arn}/incoming/*"]
+      },
+      {
+        Sid: "CleanupStagedZip",
+        Effect: "Allow",
+        Action: ["s3:DeleteObject"],
+        Resource: ["${aws_s3_bucket.uploads.arn}/incoming/*"]
+      }
+    ]
   })
 }
 
-resource "aws_iam_role_policy_attachment" "lambda_s3_put_attach" {
+resource "aws_iam_role_policy_attachment" "lambda_s3_access_attach" {
   role       = aws_iam_role.lambda_exec.name
-  policy_arn = aws_iam_policy.lambda_s3_put.arn
+  policy_arn = aws_iam_policy.lambda_s3_access.arn
 }
 
 resource "aws_lambda_function" "uploader" {
@@ -266,9 +281,15 @@ resource "aws_apigatewayv2_integration" "lambda" {
   payload_format_version = "2.0"
 }
 
-resource "aws_apigatewayv2_route" "upload" {
+resource "aws_apigatewayv2_route" "upload_init" {
   api_id    = aws_apigatewayv2_api.http.id
-  route_key = "POST /upload"
+  route_key = "POST /upload/init"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "upload_complete" {
+  api_id    = aws_apigatewayv2_api.http.id
+  route_key = "POST /upload/complete"
   target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
 }
 
